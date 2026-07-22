@@ -1,0 +1,7 @@
+# Build output
+@AllesAusladen/
+*.pbo
+*.zip
+*.rar
+*.bisign
+*.biprivatekey
