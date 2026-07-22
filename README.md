@@ -13,7 +13,7 @@ Server AND all clients need this mod.
 - Worn backpacks and equipment are never looted
 - Driver seat lock (configurable)
 - CBA settings menu (driver lock, loot radius, toggle actions/hint)
-- ClubCola easter egg 🥤
+- Easter egg 🥤
 
 ## Installation
 1. Copy `@AllesAusladen` into your Arma 3 directory
@@ -31,8 +31,8 @@ Requires Python 3. Output: `@AllesAusladen/addons/bob_unload.pbo`
 - **v1.1** — Driver seat lock, backpack protection, item count in chat.
 - **v1.1a** — Fix: item count message now reaches the triggering player correctly.
 - **v1.1b** — Switched from hint to systemChat, survives Antistasi hint spam.
-- **v1.1c** — "What's inside?" action, CBA settings menu, ClubCola easter egg.
-- **v1.1d-f** — Bugfixes: actions on foot/existing objects, ClubCola classname, grabCargo syntax.
+- **v1.1c** — "What's inside?" action, CBA settings menu, Easter egg.
+- **v1.1d-f** — Bugfixes: actions on foot/existing objects, Can classname, grabCargo syntax.
 
 ## Workshop
 [Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3769280136)
