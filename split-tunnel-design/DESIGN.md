@@ -1,7 +1,7 @@
-# Design: „Weiche“ (Arbeitstitel) – Split-Tunneling & DNS-Router für WireGuard
+# Design: Shunt – Split-Tunneling & DNS-Router für WireGuard
 
-> **Status:** Entwurf v0.1 · **Lizenz (geplant):** Apache-2.0
-> Der Name ist ein Platzhalter. Das Dokument zieht ins eigene Repo um, sobald es einen Namen gibt.
+> **Status:** Entwurf v0.2 · **Lizenz (geplant):** Apache-2.0
+> Binaries: `shuntd` (Daemon), `shunt` (CLI). Das Dokument zieht ins eigene Repo um, sobald es angelegt ist.
 
 ---
 
@@ -70,9 +70,9 @@ Kurz: *Rethink DNS für den Desktop, mit Kernel-Speed.*
 
 | Prozess | Rechte | Aufgabe |
 |---|---|---|
-| `weiched` | systemd-Service, nur `CAP_NET_ADMIN` (+`CAP_NET_BIND_SERVICE`), gehärtet | Tunnel, nftables, Routing, DNS-Proxy, API |
-| `weiche` (CLI) | User | API-Client, `weiche run --via X -- app` |
-| `weiche-ui` | User | Lokale Web-UI, spricht nur mit dem Socket |
+| `shuntd` | systemd-Service, nur `CAP_NET_ADMIN` (+`CAP_NET_BIND_SERVICE`), gehärtet | Tunnel, nftables, Routing, DNS-Proxy, API |
+| `shunt` (CLI) | User | API-Client, `shunt run --via X -- app` |
+| `shunt-ui` | User | Lokale Web-UI, spricht nur mit dem Socket |
 
 **Grundregel:** Keine Oberfläche läuft jemals mit Root-Rechten.
 
@@ -141,11 +141,11 @@ addr  = "https://10.8.0.1/dns-query"  # DoH, über den Tunnel erreichbar
 route = "tunnel:vps"                  # MUSS über diese Route laufen
 
 [tunnel.vps]
-config = "/etc/weiche/tunnels/vps.conf"   # wg-quick-kompatibel, 0600
+config = "/etc/shunt/tunnels/vps.conf"   # wg-quick-kompatibel, 0600
 dns    = "adguard-vps"
 
 [tunnel.home]
-config = "/etc/weiche/tunnels/home.conf"
+config = "/etc/shunt/tunnels/home.conf"
 dns    = "pihole"
 
 [[rule]]
@@ -196,7 +196,7 @@ Plain DNS (UDP/TCP), DoT, DoH, DNSCrypt, ODoH (via firestack, optional).
 
 ### Durchsetzung (Pflicht)
 
-- Ausgehend `udp/tcp 53` und `tcp 853` von allen außer `weiched` → DNAT auf Proxy bzw. Drop.
+- Ausgehend `udp/tcp 53` und `tcp 853` von allen außer `shuntd` → DNAT auf Proxy bzw. Drop.
 - Blockliste bekannter DoH-Endpunkte (pflegbar) + Canary-Domain `use-application-dns.net` → NXDOMAIN (Firefox schaltet DoH ab).
 - UI zeigt deutlich: *„Domain-Regeln greifen nicht für Apps mit eigenem DoH.“*
 
@@ -211,7 +211,10 @@ Plain DNS (UDP/TCP), DoT, DoH, DNSCrypt, ODoH (via firestack, optional).
 
 - **CDN-Sharing:** Domain-Regeln routen IPs, nicht Domains. Andere Seiten auf derselben CDN-IP nehmen dieselbe Route. Wird dokumentiert, nicht „gefixt“.
 - **Hardcodierte IPs / eigene Resolver** in Apps umgehen Domain-Regeln (App- oder CIDR-Regeln greifen weiterhin).
-- **nss-resolve (Varlink/D-Bus zu systemd-resolved)** umgeht Port 53. Pop!_OS/Ubuntu nutzen standardmäßig den Stub `127.0.0.53` → abfangbar. Daemon prüft `nsswitch.conf` beim Start und warnt.
+- **nss-resolve umgeht Port 53.** Auf Pop!_OS verifiziert: `hosts: files mdns4_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] dns myhostname`. glibc-Apps (`getaddrinfo`) fragen systemd-resolved damit per **Varlink**, nicht über `127.0.0.53:53` → kein DNAT möglich, resolved sieht nur sich selbst als Absender.
+  **Lösung:** Der Installer entfernt `resolve [!UNAVAIL=return]` aus `nsswitch.conf` (Backup, sauberes Rückgängigmachen bei Deinstallation). Dann greift `dns` → `/etc/resolv.conf` → `127.0.0.53` → per-cgroup-DNAT auf unsere Listener. `shuntd` prüft beim Start und verweigert DNS-Regeln (laut, in der UI), solange `resolve` aktiv ist.
+  Apps, die resolved direkt über D-Bus/Varlink fragen (selten), bleiben eine dokumentierte Lücke. Den Varlink-Socket pro App zu sperren ginge nur per LSM (AppArmor/Landlock) – Roadmap, nicht MVP.
+- **mDNS (`.local`)** geht per Multicast direkt ins LAN – bewusst so, LAN-Leak only. Mit `lan = "deny"` für die App mitgesperrt.
 
 ---
 
@@ -220,8 +223,8 @@ Plain DNS (UDP/TCP), DoT, DoH, DNSCrypt, ODoH (via firestack, optional).
 ### 6.1 App-Zuordnung via cgroup v2
 
 - Pro Route eine **persistente systemd-Slice** im User-Manager:
-  `weiche-tunnel-vps.slice`, `weiche-direct.slice`, `weiche-block.slice`.
-- `weiche run --via vps -- firefox` → `systemd-run --user --scope --slice=weiche-tunnel-vps.slice …`
+  `shunt-tunnel-vps.slice`, `shunt-direct.slice`, `shunt-block.slice`.
+- `shunt run --via vps -- firefox` → `systemd-run --user --scope --slice=shunt-tunnel-vps.slice …`
   Kindprozesse erben die cgroup automatisch (Browser-Multiprozess ✔).
 - **Wichtig:** nftables löst `socket cgroupv2`-Pfade **beim Laden der Regel** in eine cgroup-ID auf. Deshalb matchen wir auf die **langlebige Slice-Ebene**, nicht auf flüchtige Scopes.
 - **Flatpak/Snap** haben eigene Scopes (`app-flatpak-<id>-<n>.scope`). Der Daemon beobachtet systemd (D-Bus `UnitNew`) und hängt beim Erscheinen eine Regel für genau diesen Scope ein (bzw. entfernt sie beim Verschwinden).
@@ -231,7 +234,7 @@ Plain DNS (UDP/TCP), DoT, DoH, DNSCrypt, ODoH (via firestack, optional).
 ### 6.2 Markierung & Routing
 
 ```
-nft table inet weiche
+nft table inet shunt
  ├─ chain output   (type route, hook output, priority mangle)
  │    ct mark != 0  → meta mark set ct mark ; return       # bestehende Verbindungen
  │    <kompilierte Regeln, first match wins>                # setzt meta mark
@@ -256,17 +259,37 @@ nft table inet weiche
 |---|---|
 | Daemon stürzt ab | nft-Regeln & Routen bleiben im Kernel → weiter blockiert/geroutet |
 | Tunnel down | `unreachable default` greift für Regeln mit Killswitch; ohne Killswitch fällt die Regel bewusst auf `direct` zurück (Opt-out, in UI rot markiert) |
-| Boot | `weiche-lockdown.service` (`Before=network-pre.target`) lädt Minimal-Ruleset: Drop außer lo, DHCP, ggf. LAN. Aufgehoben, sobald `weiched` den Plan angewendet hat |
+| Boot | `shunt-lockdown.service` (`Before=network-pre.target`) lädt Minimal-Ruleset: Drop außer lo, DHCP, ggf. LAN. Aufgehoben, sobald `shuntd` den Plan angewendet hat |
 | Config-Fehler | Alter Plan bleibt aktiv (atomare Transaktion), Fehler an UI |
 | Panik-Knopf | Ein Aufruf → `filter_out` Policy drop für alles außer lo |
+| Captive Portal (Hotel/ICE) | Siehe 6.5 – zeitlich begrenzter Portal-Modus, nie dauerhaftes Loch |
 
-### 6.4 Härtung des Daemons
+### 6.4 Tunnel-Watchdog (DDNS)
+
+Kernel-WireGuard löst Endpoint-Hostnamen **nur einmal** auf. Ändert sich die IP (Zwangstrennung, DDNS), bleibt der Tunnel tot.
+`shuntd` überwacht `latest-handshake` pro Peer: älter als ~150 s und Traffic wartet → Endpoint-Hostname neu auflösen (über die **direct**-Route und deren Upstream, mit DNSSEC wenn möglich) und per `wgctrl` setzen. Endpoint-Änderungen werden geloggt (Hinweis auf DNS-Manipulation).
+
+### 6.5 Captive-Portal-Modus
+
+Mit Killswitch / Default-Route-Tunnel kommt man in kein Portal-WLAN.
+- NetworkManager-Connectivity-Check (`connectivity-check.ubuntu.com`) erkennt das Portal → `shuntd` meldet es der UI.
+- Nutzer aktiviert **bewusst** den Portal-Modus: **eine** dedizierte Slice (`shunt-portal.slice`) darf für **max. 5 Minuten** direkt raus; die UI startet darin einen Wegwerf-Browser (eigenes Profil, kein Session-Sharing). Alles andere bleibt gesperrt.
+- Kein globales Aufmachen, keine Ausnahme für den NetworkManager-User dauerhaft (das wäre das nächste Leck).
+
+### 6.6 Überlappende Subnetze
+
+Hotel-WLAN `192.168.1.0/24` vs. Homelab hinter dem Tunnel ebenfalls `192.168.1.0/24`:
+- Markierter Traffic (App-/CIDR-Regel → `tunnel:home`) wird per `ip rule` **vor** der Main-Tabelle in die Tunnel-Tabelle gelenkt → gewinnt automatisch. Dafür braucht die Tunnel-Tabelle explizit die Route `192.168.1.0/24 dev wg-home`.
+- Unmarkierter Traffic sieht das lokale Netz. Konflikt wird beim Verbinden erkannt und in der UI angezeigt.
+- Roadmap (P5): optionales 1:1-NAT (`10.99.1.0/24` ↔ Homelab), wenn beides gleichzeitig nötig ist.
+
+### 6.7 Härtung des Daemons
 
 - systemd: `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE`, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`*, `PrivateTmp`, `SystemCallFilter=@system-service`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK`
   (*Lesen von `/proc/<pid>` für `exe:` nötig, sonst kein Home-Zugriff.)
 - Scope-/Slice-Steuerung für User-Sessions über D-Bus des User-Managers bzw. durch die CLI selbst (läuft als der User → keine Rechteausweitung).
-- API: Unix-Socket `/run/weiche/api.sock`, Gruppe `weiche`; schreibende Aktionen über **polkit**.
-- Keys: `/etc/weiche/tunnels/*.conf`, root:root 0600. API gibt Private Keys **nie** zurück.
+- API: Unix-Socket `/run/shunt/api.sock`, Gruppe `shunt`; schreibende Aktionen über **polkit**.
+- Keys: `/etc/shunt/tunnels/*.conf`, root:root 0600. API gibt Private Keys **nie** zurück.
 - Web-UI: eigener User-Prozess, bindet nur `127.0.0.1` mit Zufallstoken, prüft `Host`/`Origin` (gegen DNS-Rebinding/CSRF).
 
 ---
@@ -293,6 +316,10 @@ Der Core bleibt identisch; `Capabilities()` meldet, was die Plattform kann, Fron
 3. **Neugierige lokale Apps** ohne Root (LAN-Scans, eigenes DNS, Umgehung)
 4. **Upstream-DNS / VPN-Gegenstelle** (sieht nur, was über die jeweilige Route läuft – Minimierung via Routing)
 
+### Hinweise für Nutzer (Doku)
+
+- Split-Tunneling auf OS-Ebene ersetzt keine Browser-Härtung. WebRTC/ICE kann lokale IPs in den Candidates verraten, auch wenn die Pakete korrekt geroutet werden → `media.peerconnection.ice.default_address_only = true` bzw. WebRTC deaktivieren.
+
 ### Nicht in scope
 
 Root-Malware auf dem Host, globaler passiver Angreifer, Browser-Fingerprinting, Account-Tracking.
@@ -314,19 +341,25 @@ Root-Malware auf dem Host, globaler passiver Angreifer, Browser-Fingerprinting, 
 | Phase | Inhalt |
 |---|---|
 | **P0** | Dieses Design, Name, Repo, Lizenz, CI-Gerüst |
-| **P1 – PoC** | `weiched` + CLI, 1 Tunnel, App-Regeln (Slices), CIDR-Regeln, Killswitch, IPv6-Block, Lockdown-Service, Integrationstests in Netns |
+| **P1 – PoC** | `shuntd` + CLI, 1 Tunnel, App-Regeln (Slices), CIDR-Regeln, Killswitch, IPv6-Block, Lockdown-Service, Endpoint-Watchdog, Integrationstests in Netns |
 | **P2 – DNS** | DNS-Proxy pro Route, Upstreams (Plain/DoT/DoH), Domain-Regeln + nft-Sets, DNS-Zwang, DoH-Blockliste |
-| **P3 – Komfort** | Mehrere Tunnel, Profile (SSID-Umschaltung, MAC/Hostname-Hygiene), Port/ASN/Presets, Web-UI, Leak-Selbsttest |
+| **P3 – Komfort** | Captive-Portal-Modus, Mehrere Tunnel, Profile (SSID-Umschaltung, MAC/Hostname-Hygiene), Port/ASN/Presets, Web-UI, Leak-Selbsttest |
 | **P4 – Release** | `.deb` für Pop!_OS, signierte reproduzierbare Builds + SBOM, App-Firewall (Default-Deny/Nachfragen), LAN-Sperre pro App, Panik-Hotkey |
-| **P5 – Kür** | Multi-Hop, Rosenpass (PQ-PSK), AmneziaWG-Modus, Padding/Cover-Traffic, Android/Windows-Backends, Tauri/Flutter-UI |
+| **P5 – Kür** | eBPF-Backend (`cgroup/connect4/6`, `cgroup_skb`) als Alternative zu nftables-Marks, 1:1-NAT bei Subnetz-Überlappung, Multi-Hop, Rosenpass (PQ-PSK), AmneziaWG-Modus, Padding/Cover-Traffic, Android/Windows-Backends, Tauri/Flutter-UI |
 
 ---
 
-## 10. Offene Fragen
+## 10. Entscheidungen & offene Fragen
 
-1. **Name** (blockiert Repo, Binärnamen, Pfade – alles hier ist `weiche` als Platzhalter).
-2. COSMIC: Startet es Apps in eigenen `app-*.scope`-Units? (Auf Pop!_OS testen: `systemd-cgls --user-unit`.)
-3. `nsswitch.conf` auf Pop!_OS: `resolve` oder `dns`? (`grep hosts /etc/nsswitch.conf`)
-4. firestack als DNS-Bibliothek nutzen oder schlank mit `miekg/dns` + eigene DoH/DoT-Clients?
-5. Unklassifizierte Prozesse im „Unterwegs“-Profil: Default-Route oder Block?
-6. Wie sollen ASN-/Preset-Listen gepflegt und **verifiziert** (signiert) verteilt werden?
+### Entschieden
+
+- **Name:** Shunt (`shuntd`, `shunt`). Namenskollisionen (GitHub, Debian-Pakete) vor Repo-Anlage prüfen.
+- **nsswitch:** `resolve` wird bei Installation entfernt (siehe 5, „Bekannte Grenzen“).
+- **DNS-Bibliothek:** `miekg/dns` + eigene DoH/DoT-Clients (stdlib). firestack nur, falls ODoH/DNSCrypt gewünscht.
+- **Unklassifizierte Prozesse:** Profil mit `killswitch = true` → **block** (Default-Deny). Ohne Killswitch → `default_route`.
+
+### Offen
+
+1. COSMIC: Startet es Apps in eigenen `app-*.scope`-Units? Bisherige Ausgabe zeigte nur `session.slice` → `systemctl --user list-units --type=scope` prüfen.
+2. Wie sollen ASN-/Preset-Listen gepflegt und **verifiziert** (signiert) verteilt werden?
+3. Portal-Modus: Wegwerf-Browser – Firefox-Profil oder eigener minimaler WebView?
